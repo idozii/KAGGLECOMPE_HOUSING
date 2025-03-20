@@ -1,9 +1,10 @@
 import pandas as pd 
 import numpy as np
 import time
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import mean_absolute_error
 import xgboost as xgb
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 import os
 
 # Start timing
@@ -51,67 +52,78 @@ def preprocess_data(train_data, test_data):
     
     return X, y, test_encoded, test_ids
 
-# Process data
 X, y, test_encoded, test_ids = preprocess_data(train_data, test_data)
 
-# Split for validation
 X_train, X_valid, y_train, y_valid = train_test_split(X, y, train_size=0.8, test_size=0.2, random_state=42)
 
-# Convert to DMatrix for better GPU performance
-print("Converting to DMatrix format for GPU optimization...")
 dtrain = xgb.DMatrix(X_train, label=y_train)
 dvalid = xgb.DMatrix(X_valid, label=y_valid)
 dtest = xgb.DMatrix(test_encoded)
 
-# XGBoost parameters optimized for GPU
-params = {
+xgb_params = {
     'max_depth': 6,
     'learning_rate': 0.05,
     'subsample': 0.8,
     'colsample_bytree': 0.8,
-    'tree_method': 'gpu_hist',
-    'predictor': 'gpu_predictor',
-    'gpu_id': 0,
+    'tree_method': 'hist',     # Updated from 'gpu_hist'
+    'device': 'cuda',         # Explicitly set device to CUDA
     'objective': 'reg:squarederror',
     'eval_metric': 'mae',
     'seed': 42
 }
 
-# Set up evaluation metrics
-evallist = [(dtrain, 'train'), (dvalid, 'valid')]
-
-# Train model using native XGBoost API
-print("Training model with GPU acceleration...")
-num_rounds = 1000
-early_stopping = 50
-
-model = xgb.train(
-    params,
-    dtrain,
-    num_rounds,
-    evallist,
-    early_stopping_rounds=early_stopping,
-    verbose_eval=25  # Print progress every 25 iterations
+gb_model = GradientBoostingRegressor(
+    n_estimators=500,
+    learning_rate=0.05,
+    max_depth=4,
+    subsample=0.8,
+    random_state=42,
+    n_iter_no_change=25
 )
+gb_model.fit(X_train, y_train)
 
-# Save best iteration number
-best_iteration = model.best_iteration
-print(f"Best iteration: {best_iteration}")
+gb_preds_valid = gb_model.predict(X_valid)
+gb_preds_test = gb_model.predict(test_encoded)
+print(f"GradientBoosting validation MAE: {mean_absolute_error(y_valid, gb_preds_valid)}")
 
-# Make predictions
-print("Making predictions...")
-predictions = model.predict(dvalid)
-mae = mean_absolute_error(y_valid, predictions)
-print(f"Validation MAE: {mae}")
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+xgb_cv_preds_test = np.zeros(test_encoded.shape[0])
+fold_scores = []
 
-# Generate test predictions
-preds = model.predict(dtest)
+for fold, (train_idx, val_idx) in enumerate(kf.split(X, y)):
+    print(f"Training fold {fold+1}...")
+    X_fold_train, X_fold_val = X.iloc[train_idx], X.iloc[val_idx]
+    y_fold_train, y_fold_val = y.iloc[train_idx], y.iloc[val_idx]
+    
+    # Convert to DMatrix for this fold
+    dtrain_fold = xgb.DMatrix(X_fold_train, label=y_fold_train)
+    dval_fold = xgb.DMatrix(X_fold_val, label=y_fold_val)
+    
+    # Train model with updated parameters
+    evallist_fold = [(dtrain_fold, 'train'), (dval_fold, 'valid')]
+    xgb_fold = xgb.train(
+        xgb_params,
+        dtrain_fold,
+        500,
+        evallist_fold,
+        early_stopping_rounds=50,
+        verbose_eval=False
+    )
+    
+    # Validate fold model
+    fold_preds = xgb_fold.predict(dval_fold)
+    fold_mae = mean_absolute_error(y_fold_val, fold_preds)
+    fold_scores.append(fold_mae)
+    print(f"Fold {fold+1} MAE: {fold_mae}")
+    
+    # Add predictions to ensemble
+    xgb_cv_preds_test += xgb_fold.predict(dtest) / kf.n_splits
 
-# Create submission file
-print("Creating submission file...")
-submission = pd.DataFrame({'Id': test_ids, 'SalePrice': preds})
+print(f"Average K-fold MAE: {np.mean(fold_scores)}")
+
+# Combine predictions
+final_preds_test = 0.25 * gb_preds_test + 0.75 * xgb_cv_preds_test
+
+# Save submission
+submission = pd.DataFrame({'Id': test_ids, 'SalePrice': final_preds_test})
 submission.to_csv('submission.csv', index=False)
-
-# Report performance
-elapsed_time = time.time() - start_time
-print(f"Total execution time: {elapsed_time:.2f} seconds")
